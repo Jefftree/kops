@@ -64,7 +64,13 @@ func (b *EtcdManagerOptionsBuilder) BuildOptions(o *kops.Cluster) error {
 			etcdCluster.Backups.BackupStore = join(base, "backups", "etcd", etcdCluster.Name)
 		}
 
-		if !etcdVersionIsSupported(etcdCluster.Version) {
+		if etcdCluster.Image != "" {
+			// A custom etcd image bypasses the supported-version check: the
+			// binary is sourced from the user-supplied image, so kops does not
+			// need a bundled image for this version (used e.g. for skew tests
+			// against pre-release etcd builds).
+			klog.V(2).Infof("etcd cluster %q has a custom image %q; skipping version check for %q", etcdCluster.Name, etcdCluster.Image, etcdCluster.Version)
+		} else if !etcdVersionIsSupported(etcdCluster.Version) {
 			if featureflag.SkipEtcdVersionCheck.Enabled() {
 				klog.Warningf("etcd version %q is not known to be supported, but ignoring because of SkipEtcdVersionCheck feature flag", etcdCluster.Version)
 			} else {
@@ -124,6 +130,40 @@ func etcdVersionIsSupported(version string) bool {
 		}
 	}
 	return false
+}
+
+// etcdVersionsForCluster returns the etcd versions whose binaries need to be
+// staged in the etcd-manager pod for the given cluster. When the cluster
+// specifies a custom Image, the entry for that cluster's Version is replaced
+// (or added) with the user-supplied image, and any symlink entries targeting
+// that version are dropped so the override is the sole source for the binary.
+func etcdVersionsForCluster(etcdCluster kops.EtcdClusterSpec) []etcdVersion {
+	versions := etcdSupportedVersions()
+	customVersion := strings.TrimPrefix(etcdCluster.Version, "v")
+	// An empty customVersion would erroneously match every "latest" entry's
+	// empty SymlinkToVersion below; treat that as "no override applicable"
+	// so the caller falls back to the bundled set unchanged.
+	if etcdCluster.Image == "" || customVersion == "" {
+		return versions
+	}
+
+	out := make([]etcdVersion, 0, len(versions)+1)
+	found := false
+	for _, v := range versions {
+		if v.SymlinkToVersion == customVersion {
+			continue
+		}
+		if v.Version == customVersion {
+			v.Image = etcdCluster.Image
+			v.SymlinkToVersion = ""
+			found = true
+		}
+		out = append(out, v)
+	}
+	if !found {
+		out = append(out, etcdVersion{Version: customVersion, Image: etcdCluster.Image})
+	}
+	return out
 }
 
 func join(base string, others ...string) string {
